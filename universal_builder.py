@@ -114,7 +114,25 @@ Pulleys (high-error area -- be strict)
 Verification
 - Before finalising, check the invariants: one rope -> one tension; strand count
   matches the stated mechanical advantage; every rope tangent to its wheel;
-  limiting cases look right. Offer matplotlib code the user can render to verify.
+  limiting cases look right.
+""".strip()
+
+FIGURE_EMISSION = """
+HOW TO EMIT FIGURES (the app renders them automatically and inline):
+- The app EXECUTES your matplotlib code and shows the finished image right where
+  you place it. The reader sees a book with embedded figures -- never code.
+- So whenever a figure belongs in the text, drop a SINGLE self-contained
+  ```python code block at exactly that point in the writing.
+- Begin every figure block with a caption comment on the first line, like:
+      # FIGURE: Figure 2.1 - Potential energy well
+- Compute everything from the real equations with numpy/matplotlib, set axis
+  labels with units, a legend if needed, and ax.set_aspect('equal') for geometry.
+- Do NOT write "see the figure below / run this code / as shown in the plot you
+  can generate". Just place the block; it becomes the figure.
+- One figure per code block. Make each block runnable on its own (do its own
+  imports). plt.show() is optional and harmless.
+- For a symbolic/numeric VERIFICATION (not a drawing), use a ```python block that
+  prints its result; the app shows that result in a small collapsible note.
 """.strip()
 
 # ---------------------------------------------------------------------------
@@ -126,34 +144,37 @@ PERSONAS = {
         "You are a master physics and mathematics author writing a rigorous, "
         "engaging multi-chapter book. You produce complete, polished, "
         "publication-ready chapters with clear structure, worked examples, and "
-        "intuition alongside rigor. Maintain continuity of voice, notation, and "
-        "numbering across chapters.\n\n" + MATH_RULES + "\n\n" + PHYSICS_FIGURE_RULES
+        "intuition alongside rigor. You weave figures directly into the writing "
+        "wherever they aid understanding. Maintain continuity of voice, notation, "
+        "and numbering across chapters.\n\n"
+        + MATH_RULES + "\n\n" + PHYSICS_FIGURE_RULES + "\n\n" + FIGURE_EMISSION
     ),
     "Mechanics Diagram Engineer (FBD/pulleys/inclines)": (
         "You are a mechanics figure specialist. You produce correct free-body "
         "diagrams and mechanics schematics (pulleys, inclines, springs, levers) "
-        "as clean, runnable matplotlib code that the user can render to verify. "
-        "You are meticulous about physical correctness.\n\n" + PHYSICS_FIGURE_RULES
-        + "\n\n" + MATH_RULES
+        "as clean matplotlib code that the app renders inline. You are meticulous "
+        "about physical correctness.\n\n"
+        + PHYSICS_FIGURE_RULES + "\n\n" + FIGURE_EMISSION + "\n\n" + MATH_RULES
     ),
     "Figure & Plot Coder (matplotlib)": (
-        "You turn physics and math into accurate matplotlib figures. You always "
-        "compute curves from the real equation with numpy, set sensible axes, "
-        "units, legends and aspect ratio, and return a single self-contained "
-        "```python code block the user can run in the Figure & Math Lab.\n\n"
-        + PHYSICS_FIGURE_RULES + "\n\n" + MATH_RULES
+        "You turn physics and math into accurate matplotlib figures that the app "
+        "renders inline. You always compute curves from the real equation with "
+        "numpy and set sensible axes, units, legends and aspect ratio.\n\n"
+        + PHYSICS_FIGURE_RULES + "\n\n" + FIGURE_EMISSION + "\n\n" + MATH_RULES
     ),
     "Derivation Verifier (SymPy)": (
         "You verify mathematical derivations. For each claimed result, you give "
         "a clear step-by-step derivation AND a self-contained ```python SymPy "
         "snippet that proves it symbolically (and numerically where helpful), "
-        "printing a clear PASS/representation at the end.\n\n" + MATH_RULES
+        "printing a clear PASS/representation at the end.\n\n"
+        + MATH_RULES + "\n\n" + FIGURE_EMISSION
     ),
     "Problem Set Writer (with solutions)": (
         "You write physics/math problem sets with full, verified solutions. Each "
         "problem states given/find, the solution shows every step, and you "
         "include a SymPy or numpy check of the final answer in a ```python block. "
-        "Vary difficulty and label it.\n\n" + MATH_RULES + "\n\n" + PHYSICS_FIGURE_RULES
+        "Vary difficulty and label it.\n\n"
+        + MATH_RULES + "\n\n" + PHYSICS_FIGURE_RULES + "\n\n" + FIGURE_EMISSION
     ),
     "Senior Full-Stack Engineer (SaaS apps)": (
         "You are an elite full-stack software engineer. You design and write "
@@ -322,31 +343,51 @@ def assemble_manuscript():
 
 
 # ---------------------------------------------------------------------------
-# 6. FIGURE & MATH LAB  (run the AI's code, render & verify)
+# 6. INHERENT FIGURE RENDERING  (auto-run figure code, embed images inline)
 # ---------------------------------------------------------------------------
 
-def extract_last_python_block():
-    """Return the most recent ```python ...``` block from the conversation."""
-    for m in reversed(st.session_state.get("messages", [])):
-        if m["role"] != "assistant":
-            continue
-        blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", m["content"], re.DOTALL)
-        # Prefer a block that looks like plotting / sympy.
-        for b in reversed(blocks):
-            if any(k in b for k in ("matplotlib", "plt.", "import numpy", "sympy", "np.")):
-                return b.strip()
-        if blocks:
-            return blocks[-1].strip()
-    return ""
+# Split a reply into ordered ("text", str) and ("code", lang, body) segments.
+_CODE_SPLIT = re.compile(r"```([\w+\-]*)\s*\n(.*?)```", re.DOTALL)
+
+
+def split_segments(text: str):
+    segments = []
+    pos = 0
+    for m in _CODE_SPLIT.finditer(text or ""):
+        if m.start() > pos:
+            segments.append(("text", text[pos:m.start()]))
+        segments.append(("code", (m.group(1) or "").lower().strip(), m.group(2)))
+        pos = m.end()
+    if pos < len(text or ""):
+        segments.append(("text", text[pos:]))
+    return segments
+
+
+def _caption_from_code(code: str):
+    """Pull a '# FIGURE: ...' caption from the first lines of a code block."""
+    for line in code.splitlines()[:4]:
+        m = re.match(r"\s*#\s*FIGURE:\s*(.+)", line, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
 
 
 def run_python_code(code: str):
     """
     Execute code with matplotlib(Agg)/numpy/sympy preloaded.
-    Returns (stdout_text, figure_or_None, error_or_None).
-    Note: this runs code in-process; only run code you trust (yours/the model's).
+    Returns dict: {png: bytes|None, stdout: str, error: str|None}.
+    Results are cached per code-hash so reruns are instant.
+    NOTE: runs code in-process; intended for your own / the model's code on a
+    private, password-gated app.
     """
+    import hashlib
+    cache = st.session_state.setdefault("fig_cache", {})
+    key = hashlib.md5(code.encode("utf-8")).hexdigest()
+    if key in cache:
+        return cache[key]
+
     out = io.StringIO()
+    result = {"png": None, "stdout": "", "error": None}
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -357,19 +398,59 @@ def run_python_code(code: str):
         except Exception:
             sp = None
         plt.close("all")
-        ns = {
-            "plt": plt, "matplotlib": matplotlib,
-            "np": np, "numpy": np,
-            "sp": sp, "sympy": sp,
-            "__name__": "__main__",
-        }
+        ns = {"plt": plt, "matplotlib": matplotlib, "np": np, "numpy": np,
+              "sp": sp, "sympy": sp, "__name__": "__main__"}
         with contextlib.redirect_stdout(out):
-            exec(code, ns)  # noqa: S102 - intentional, user-controlled lab
+            exec(code, ns)  # noqa: S102 - intentional, user-controlled content
+        result["stdout"] = out.getvalue()
         fignums = plt.get_fignums()
-        fig = plt.figure(fignums[-1]) if fignums else None
-        return out.getvalue(), fig, None
+        if fignums:
+            buf = io.BytesIO()
+            plt.figure(fignums[-1]).savefig(buf, format="png", dpi=200,
+                                             bbox_inches="tight")
+            result["png"] = buf.getvalue()
+        plt.close("all")
     except Exception:
-        return out.getvalue(), None, traceback.format_exc()
+        result["stdout"] = out.getvalue()
+        result["error"] = traceback.format_exc()
+    cache[key] = result
+    return result
+
+
+def render_book_message(text: str, show_code: bool):
+    """Render a reply as a book: prose as markdown, figure code as live images,
+    verification code as a small collapsible note."""
+    for seg in split_segments(text):
+        if seg[0] == "text":
+            if seg[1].strip():
+                st.markdown(seg[1])
+            continue
+        _, lang, body = seg
+        # Non-python code (sql, js, ...) -> show as a normal code block.
+        if lang not in ("", "python", "py"):
+            st.code(body, language=lang or None)
+            continue
+        # Python -> execute. Figure -> image; print-only -> note; else -> code.
+        res = run_python_code(body)
+        if res["png"]:
+            st.image(res["png"], caption=_caption_from_code(body), use_container_width=True)
+            if show_code:
+                with st.expander("Figure code"):
+                    st.code(body, language="python")
+            st.download_button("Download figure (PNG)", data=res["png"],
+                               file_name="figure.png", mime="image/png",
+                               key=f"png-{hash(body) & 0xffffffff}")
+        elif res["error"]:
+            with st.expander("A figure could not be rendered (show code & error)"):
+                st.code(body, language="python")
+                st.code(res["error"])
+        elif res["stdout"].strip():
+            with st.expander("Verification / computed result"):
+                st.text(res["stdout"])
+                if show_code:
+                    st.code(body, language="python")
+        elif show_code:
+            st.code(body, language="python")
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +586,10 @@ def main():
 
         st.divider()
         st.subheader("Book tools")
+        st.session_state.show_code = st.checkbox(
+            "Show the code behind figures", value=st.session_state.get("show_code", False),
+            help="Off by default so it reads like a finished book. Figures render "
+                 "automatically either way.")
         if st.button("Assemble saved chapters -> manuscript"):
             manuscript, where = assemble_manuscript()
             if manuscript is None:
@@ -532,40 +617,14 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # ----- Replay history ------------------------------------------------
+    # ----- Replay history (figures rendered inline, like a book) ---------
+    show_code = st.session_state.get("show_code", False)
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # ----- Figure & Math Lab --------------------------------------------
-    with st.expander("Figure & Math Lab - run / render / verify the AI's code", expanded=False):
-        st.caption("Runs matplotlib & SymPy code so you can SEE a figure or "
-                   "confirm a derivation. Runs code in-process - only run code "
-                   "you trust (yours or the model's).")
-        default_code = extract_last_python_block()
-        code = st.text_area("Python code (auto-filled from the last reply)",
-                            value=default_code, height=220, key="lab_code")
-        if st.button("Run code"):
-            if not code.strip():
-                st.info("No code to run yet. Ask for a figure or a SymPy check first.")
+            if msg["role"] == "assistant":
+                render_book_message(msg["content"], show_code)
             else:
-                stdout_text, fig, error = run_python_code(code)
-                if stdout_text.strip():
-                    st.text(stdout_text)
-                if fig is not None:
-                    st.pyplot(fig)
-                    buf = io.BytesIO()
-                    try:
-                        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-                        st.download_button("Download figure (PNG)", data=buf.getvalue(),
-                                           file_name="figure.png", mime="image/png")
-                    except Exception:
-                        pass
-                if error:
-                    st.error("Error while running the code:")
-                    st.code(error)
-                elif fig is None and not stdout_text.strip():
-                    st.info("Ran with no printed output and no figure produced.")
+                st.markdown(msg["content"])
 
     # ----- Input (chat box OR a queued action) ---------------------------
     prompt = st.chat_input("Ask for a chapter, a figure, a derivation - or 'Save this as ch1.md'")
@@ -612,24 +671,21 @@ def main():
     client = get_client(api_key)
     api_messages = build_api_messages(full_system)
 
+    failed = False
     with st.chat_message("assistant"):
         try:
+            # Stream the draft live (shows progress); figures get rendered on the
+            # rerun below so they appear inline within the finished text.
             answer_text = stream_response(client, model_id, api_messages, temperature, max_tokens)
         except Exception as exc:  # noqa: BLE001
             answer_text = f"Something went wrong calling DeepSeek:\n\n`{exc}`"
             st.error(answer_text)
-        else:
-            if answer_text:
-                st.download_button("Download this response", data=answer_text,
-                                   file_name=f"response-{datetime.now():%Y%m%d-%H%M%S}.md",
-                                   mime="text/markdown",
-                                   key=f"dl-{len(st.session_state.messages)}")
+            failed = True
 
     st.session_state.messages.append({"role": "assistant", "content": answer_text})
-    # If the reply contains runnable code, hint the user toward the Lab.
-    if re.search(r"```(?:python|py)?\s*\n", answer_text or ""):
-        st.info("This reply contains code - open **Figure & Math Lab** above to "
-                "render the figure or run the verification.")
+    # Re-run so the reply is re-rendered as a book with figures executed inline.
+    if not failed:
+        st.rerun()
 
 
 if __name__ == "__main__":
