@@ -1,0 +1,12 @@
+# Never commit real secrets
+.streamlit/secrets.toml
+config.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local output
+output/
