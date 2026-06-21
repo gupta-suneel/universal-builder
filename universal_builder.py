@@ -1,34 +1,39 @@
 """
 universal_builder.py
 =====================
-A conversational, multi-purpose builder powered by the DeepSeek API.
+A conversational studio for writing complex physics & math books (and SaaS
+code) powered by the DeepSeek API. Runs locally on a Mac or as a private
+cloud app on Streamlit Community Cloud.
 
-Write complex multi-chapter books, generate SaaS code, design database
-schemas, and more -- all through one chat interface. Runs locally on a Mac
-or as a private cloud app on Streamlit Community Cloud.
-
-FEATURES
-  1. DYNAMIC PERSONA SHIFTER   - changing the sidebar persona applies on the
-     very next message. The system prompt is rebuilt fresh on every call.
-     Includes a "Custom" persona you can edit freely.
-  2. DEEPSEEK REASONING CHAINS - the 'deepseek-reasoner' (R1) model's hidden
-     chain-of-thought (delta.reasoning_content) streams live into a clean,
-     collapsible "AI Thinking Process" box.
-  3. LOCAL FILE AUTO-SAVING    - say "Save this chapter as kinematics.txt" and
-     it writes to ~/Documents/ai-workspace/universal_book_builder/output/.
-     A download button is always offered too (works on the cloud).
-  4. PERSISTENT API KEY        - the key is read from secrets / env / a saved
-     local file. Once provided it is never asked for again.
+CORE FEATURES
+  1. DYNAMIC PERSONA SHIFTER   - switching persona applies on the next message;
+     the system prompt is rebuilt fresh every call. Includes book-writing
+     personas with physics-figure and math conventions baked in.
+  2. DEEPSEEK REASONING CHAINS - the R1 reasoner's hidden chain-of-thought
+     streams into a collapsible "AI Thinking Process" box.
+  3. LOCAL FILE AUTO-SAVING    - "Save this chapter as kinematics.txt" writes to
+     ~/Documents/ai-workspace/universal_book_builder/output/ (+ a download).
+  4. PERSISTENT API KEY        - read from secrets / env / saved file; asked once.
   5. PASSWORD GATE             - set APP_PASSWORD to keep the cloud app private.
-  6. VERSATILE CONTROLS        - model picker, creativity slider, response-length
-     limit, custom system prompt, response download, and conversation export.
+
+PHYSICS / MATH BOOK TOOLS
+  6. BOOK STYLE GUIDE          - a persistent notation/level panel injected into
+     every prompt so chapters stay consistent.
+  7. LATEX MATH RENDERING      - equations in $...$ / $$...$$ render natively.
+  8. FIGURE & MATH LAB         - runs the AI's matplotlib/SymPy code, renders the
+     figure inline so you can VERIFY it, prints output, and exports PNG.
+  9. CONTINUE WRITING          - one click to seamlessly extend a long chapter.
+ 10. MANUSCRIPT ASSEMBLER      - merge saved chapters into one downloadable book.
 
 Run locally:   streamlit run universal_builder.py
 """
 
+import io
 import json
 import os
 import re
+import contextlib
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -43,7 +48,7 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 APP_DIR = Path.home() / "Documents" / "ai-workspace" / "universal_book_builder"
 OUTPUT_DIR = APP_DIR / "output"
-CONFIG_FILE = APP_DIR / "config.json"   # stores a remembered API key locally
+CONFIG_FILE = APP_DIR / "config.json"
 
 MODELS = {
     "DeepSeek V3 (deepseek-chat) - fast, general purpose": "deepseek-chat",
@@ -51,57 +56,127 @@ MODELS = {
 }
 
 # ---------------------------------------------------------------------------
-# 1. PERSONAS  (the dropdown that drives behaviour)
+# 1. SHARED RULE BLOCKS  (the physics/math knowledge baked into the AI)
+# ---------------------------------------------------------------------------
+
+MATH_RULES = """
+MATH & NOTATION RULES (always follow):
+- Write ALL mathematics in LaTeX: inline as $...$ and displayed as $$...$$.
+  These render in the app, so never write equations as plain text.
+- Define every symbol the first time it appears, and keep notation identical
+  across chapters. Obey the BOOK STYLE GUIDE if one is provided.
+- Number displayed/important equations so they can be cross-referenced.
+- State and check the units; keep every equation dimensionally consistent.
+- Sanity-check results against limiting cases (small angle, large/zero mass,
+  t->0 or t->infinity) and mention the check.
+- When a derivation matters, ALSO provide a short, runnable SymPy snippet in a
+  ```python code block that verifies the key result. The user can run it in the
+  app's Figure & Math Lab to confirm it.
+""".strip()
+
+PHYSICS_FIGURE_RULES = """
+PHYSICS FIGURE RULES (always follow when a figure is involved):
+General accuracy
+- Draw figures FROM THE REAL EQUATION OR DATA computed with numpy -- never
+  sketch an approximate shape by eye.
+- Preserve the meaning-carrying features: equilibria, turning points,
+  asymptotes, intercepts, symmetry and limiting behaviour.
+- Use ax.set_aspect('equal') for anything geometric (angles, circles, orbits)
+  so circles stay circular and right angles stay right angles.
+- Label every axis with units, add a legend for multiple curves, and annotate
+  the key physical points directly.
+
+Free-body diagrams & vectors
+- Every force is an arrow starting on the body, pointing the correct way, with
+  length roughly proportional to its magnitude, and labeled. Invent no forces.
+- Draw vector components to scale and at true right angles. Show the coordinate
+  axes and the chosen sign convention.
+
+Fields
+- Field lines never cross; equipotential / wavefront lines stay perpendicular
+  to the field lines.
+
+Pulleys (high-error area -- be strict)
+- ONE continuous ideal rope has ONE tension: it is identical on both sides of a
+  frictionless, massless pulley. Do not label the two sides T1 and T2.
+- Mechanical advantage = the number of rope strands that actually support the
+  load. A fixed pulley only redirects force (advantage 1); a movable pulley is
+  held by 2 strands (force = W/2); a block-and-tackle with N supporting strands
+  gives W/N. The drawing must literally show that many strands.
+- The rope is TANGENT to the wheel and never routed through its centre.
+  Supporting strands hang vertical and parallel.
+- Distinguish fixed (anchored) from movable (rises with the load) pulleys. Show
+  the wheel, a centre axle, and the mount/hook to a hatched support. Hang masses
+  as blocks with weight mg down and tension T up.
+- Know the canonical setups cold: the Atwood machine (two masses over one fixed
+  pulley, equal tension throughout) and the single movable-pulley lift.
+
+Verification
+- Before finalising, check the invariants: one rope -> one tension; strand count
+  matches the stated mechanical advantage; every rope tangent to its wheel;
+  limiting cases look right. Offer matplotlib code the user can render to verify.
+""".strip()
+
+# ---------------------------------------------------------------------------
+# 2. PERSONAS
 # ---------------------------------------------------------------------------
 
 PERSONAS = {
-    "Master Author (multi-chapter books)": (
-        "You are a master non-fiction and fiction author. You write rich, "
-        "well-structured, multi-chapter books. Maintain narrative and tonal "
-        "continuity across chapters, use clear headings, and keep the reader "
-        "engaged. When asked for a chapter, deliver a complete, polished, "
-        "publication-ready chapter -- never an outline unless explicitly asked."
+    "Physics & Math Author (chapters)": (
+        "You are a master physics and mathematics author writing a rigorous, "
+        "engaging multi-chapter book. You produce complete, polished, "
+        "publication-ready chapters with clear structure, worked examples, and "
+        "intuition alongside rigor. Maintain continuity of voice, notation, and "
+        "numbering across chapters.\n\n" + MATH_RULES + "\n\n" + PHYSICS_FIGURE_RULES
+    ),
+    "Mechanics Diagram Engineer (FBD/pulleys/inclines)": (
+        "You are a mechanics figure specialist. You produce correct free-body "
+        "diagrams and mechanics schematics (pulleys, inclines, springs, levers) "
+        "as clean, runnable matplotlib code that the user can render to verify. "
+        "You are meticulous about physical correctness.\n\n" + PHYSICS_FIGURE_RULES
+        + "\n\n" + MATH_RULES
+    ),
+    "Figure & Plot Coder (matplotlib)": (
+        "You turn physics and math into accurate matplotlib figures. You always "
+        "compute curves from the real equation with numpy, set sensible axes, "
+        "units, legends and aspect ratio, and return a single self-contained "
+        "```python code block the user can run in the Figure & Math Lab.\n\n"
+        + PHYSICS_FIGURE_RULES + "\n\n" + MATH_RULES
+    ),
+    "Derivation Verifier (SymPy)": (
+        "You verify mathematical derivations. For each claimed result, you give "
+        "a clear step-by-step derivation AND a self-contained ```python SymPy "
+        "snippet that proves it symbolically (and numerically where helpful), "
+        "printing a clear PASS/representation at the end.\n\n" + MATH_RULES
+    ),
+    "Problem Set Writer (with solutions)": (
+        "You write physics/math problem sets with full, verified solutions. Each "
+        "problem states given/find, the solution shows every step, and you "
+        "include a SymPy or numpy check of the final answer in a ```python block. "
+        "Vary difficulty and label it.\n\n" + MATH_RULES + "\n\n" + PHYSICS_FIGURE_RULES
     ),
     "Senior Full-Stack Engineer (SaaS apps)": (
         "You are an elite full-stack software engineer. You design and write "
-        "clean, production-grade, secure code for SaaS applications. Default to "
-        "modern best practices, include brief setup notes, and wrap all code in "
-        "fenced code blocks with the correct language tag."
-    ),
-    "Database Architect (schemas & SQL)": (
-        "You are a senior database architect. You design normalized, scalable "
-        "schemas and write correct, well-commented SQL. Always wrap SQL in "
-        "```sql fenced code blocks and note the target engine when relevant."
+        "clean, production-grade, secure code for SaaS applications. Wrap all "
+        "code in fenced code blocks with the correct language tag and include "
+        "brief setup notes."
     ),
     "Technical Educator (clear explanations)": (
         "You are a patient technical educator. You explain complex topics in "
         "plain language with concrete examples and analogies, building from "
-        "first principles so a motivated beginner can follow along."
+        "first principles.\n\n" + MATH_RULES
     ),
-    "Marketing Copywriter": (
-        "You are a sharp marketing copywriter. You write persuasive, on-brand "
-        "copy -- landing pages, emails, ads, and social posts -- with strong "
-        "hooks and clear calls to action."
-    ),
-    "Business Strategist": (
-        "You are a seasoned business strategist. You give structured, practical "
-        "advice on product, go-to-market, pricing, and operations, with clear "
-        "trade-offs and concrete next steps."
-    ),
-    "General Assistant": (
-        "You are a helpful, knowledgeable, and concise assistant."
-    ),
-    "Custom (edit your own)": "",  # filled in from the sidebar text area
+    "General Assistant": "You are a helpful, knowledgeable, and concise assistant.",
+    "Custom (edit your own)": "",
 }
 
 CUSTOM_PERSONA_LABEL = "Custom (edit your own)"
 
 # ---------------------------------------------------------------------------
-# 2. SECRETS / CONFIG HELPERS
+# 3. SECRETS / CONFIG HELPERS
 # ---------------------------------------------------------------------------
 
 def get_secret(key: str, default=None):
-    """Safely read a Streamlit secret without crashing when none are defined."""
     try:
         return st.secrets[key]
     except Exception:
@@ -109,36 +184,24 @@ def get_secret(key: str, default=None):
 
 
 def read_saved_key():
-    """Return a previously remembered API key from the local config file."""
     try:
         if CONFIG_FILE.exists():
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            return data.get("DEEPSEEK_API_KEY")
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8")).get("DEEPSEEK_API_KEY")
     except Exception:
         pass
     return None
 
 
 def write_saved_key(api_key: str):
-    """Remember the API key locally so it is not asked for again."""
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(
-            json.dumps({"DEEPSEEK_API_KEY": api_key}), encoding="utf-8"
-        )
+        CONFIG_FILE.write_text(json.dumps({"DEEPSEEK_API_KEY": api_key}), encoding="utf-8")
         return True
     except Exception:
         return False
 
 
 def resolve_api_key():
-    """
-    Resolve the API key once, in priority order:
-      1. Streamlit secret  (used on Streamlit Community Cloud)
-      2. Environment variable
-      3. Remembered local config file
-    Returns (key, source) where key may be None.
-    """
     key = get_secret("DEEPSEEK_API_KEY")
     if key:
         return key, "secret"
@@ -152,20 +215,15 @@ def resolve_api_key():
 
 
 # ---------------------------------------------------------------------------
-# 3. PASSWORD GATE
+# 4. PASSWORD GATE
 # ---------------------------------------------------------------------------
 
 def check_password() -> bool:
-    """
-    If APP_PASSWORD is configured (as a secret or env var), require it before
-    showing the app. If it is not configured (typical local use), allow access.
-    """
     expected = get_secret("APP_PASSWORD") or os.environ.get("APP_PASSWORD")
     if not expected:
         return True
     if st.session_state.get("auth_ok"):
         return True
-
     st.title("Universal Builder")
     st.caption("This app is private. Please enter the password to continue.")
     with st.form("login_form"):
@@ -181,14 +239,13 @@ def check_password() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 4. FILE-OPERATIONS MODULE  (local auto-saving + downloads)
+# 5. FILE OPERATIONS
 # ---------------------------------------------------------------------------
 
 SAVE_PATTERN = re.compile(
     r"save\s+(?:this|it|the)?\s*"
-    r"(?:chapter|file|code|content|page|document)?\s*"
-    r"as\s+"
-    r"[\"']?([\w\-. ]+\.[A-Za-z0-9]+)[\"']?",
+    r"(?:chapter|file|code|content|page|document|figure)?\s*"
+    r"as\s+[\"']?([\w\-. ]+\.[A-Za-z0-9]+)[\"']?",
     re.IGNORECASE,
 )
 
@@ -204,7 +261,6 @@ def detect_save_request(text: str):
 
 
 def extract_saveable_content(message_text: str) -> str:
-    """Save just the code if the message has code blocks, else the full text."""
     if not message_text:
         return ""
     code_blocks = re.findall(r"```[\w+\-]*\n(.*?)```", message_text, re.DOTALL)
@@ -214,11 +270,6 @@ def extract_saveable_content(message_text: str) -> str:
 
 
 def save_file(filename: str, content: str):
-    """
-    Try to write content to OUTPUT_DIR/filename.
-    Returns (path_or_None, error_or_None). On read-only cloud filesystems the
-    write may fail gracefully -- the caller still offers a download button.
-    """
     safe_name = Path(filename).name
     try:
         out_dir = ensure_output_dir()
@@ -230,7 +281,6 @@ def save_file(filename: str, content: str):
 
 
 def handle_possible_save(user_text: str):
-    """If the latest message is a save request, package the content to save."""
     filename = detect_save_request(user_text)
     if not filename:
         return None
@@ -246,8 +296,84 @@ def handle_possible_save(user_text: str):
     return {"filename": filename, "content": content, "path": path, "error": error}
 
 
+def assemble_manuscript():
+    """Concatenate saved .md/.txt chapters in OUTPUT_DIR into one manuscript."""
+    if not OUTPUT_DIR.exists():
+        return None, "No saved chapters found yet."
+    parts = sorted(
+        [p for p in OUTPUT_DIR.iterdir()
+         if p.suffix.lower() in (".md", ".txt") and p.name != "manuscript_assembled.md"]
+    )
+    if not parts:
+        return None, "No .md or .txt chapters found in the output folder yet."
+    pieces = []
+    for p in parts:
+        try:
+            pieces.append(f"\n\n# {p.stem}\n\n" + p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    manuscript = "\n".join(pieces).strip() + "\n"
+    out = OUTPUT_DIR / "manuscript_assembled.md"
+    try:
+        out.write_text(manuscript, encoding="utf-8")
+    except Exception:
+        out = None
+    return manuscript, (str(out) if out else None)
+
+
 # ---------------------------------------------------------------------------
-# 5. DEEPSEEK CLIENT & STREAMING
+# 6. FIGURE & MATH LAB  (run the AI's code, render & verify)
+# ---------------------------------------------------------------------------
+
+def extract_last_python_block():
+    """Return the most recent ```python ...``` block from the conversation."""
+    for m in reversed(st.session_state.get("messages", [])):
+        if m["role"] != "assistant":
+            continue
+        blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", m["content"], re.DOTALL)
+        # Prefer a block that looks like plotting / sympy.
+        for b in reversed(blocks):
+            if any(k in b for k in ("matplotlib", "plt.", "import numpy", "sympy", "np.")):
+                return b.strip()
+        if blocks:
+            return blocks[-1].strip()
+    return ""
+
+
+def run_python_code(code: str):
+    """
+    Execute code with matplotlib(Agg)/numpy/sympy preloaded.
+    Returns (stdout_text, figure_or_None, error_or_None).
+    Note: this runs code in-process; only run code you trust (yours/the model's).
+    """
+    out = io.StringIO()
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        try:
+            import sympy as sp
+        except Exception:
+            sp = None
+        plt.close("all")
+        ns = {
+            "plt": plt, "matplotlib": matplotlib,
+            "np": np, "numpy": np,
+            "sp": sp, "sympy": sp,
+            "__name__": "__main__",
+        }
+        with contextlib.redirect_stdout(out):
+            exec(code, ns)  # noqa: S102 - intentional, user-controlled lab
+        fignums = plt.get_fignums()
+        fig = plt.figure(fignums[-1]) if fignums else None
+        return out.getvalue(), fig, None
+    except Exception:
+        return out.getvalue(), None, traceback.format_exc()
+
+
+# ---------------------------------------------------------------------------
+# 7. DEEPSEEK CLIENT & STREAMING
 # ---------------------------------------------------------------------------
 
 def get_client(api_key: str) -> OpenAI:
@@ -255,13 +381,8 @@ def get_client(api_key: str) -> OpenAI:
 
 
 def build_api_messages(system_prompt: str):
-    """
-    Rebuild the message list fresh on every call.
-
-    KEY FIX (persona shifter): the system prompt is injected HERE, from the
-    CURRENT sidebar selection, every single time. It is never stored in
-    history, so switching personas mid-chat takes effect immediately.
-    """
+    """Rebuild the message list fresh every call so the persona/style guide are
+    always current (the persona-shifter fix)."""
     system_msg = {"role": "system", "content": system_prompt}
     history = [
         {"role": m["role"], "content": m["content"]}
@@ -272,33 +393,26 @@ def build_api_messages(system_prompt: str):
 
 
 def stream_response(client, model_id, messages, temperature, max_tokens):
-    """Stream a DeepSeek completion, rendering reasoning + answer separately."""
     reasoning_box = st.empty()
     answer_box = st.empty()
     reasoning_text = ""
     answer_text = ""
 
-    # Build kwargs. The reasoner model ignores sampling params, so only the
-    # chat model receives temperature.
     kwargs = {"model": model_id, "messages": messages, "stream": True,
               "max_tokens": int(max_tokens)}
     if model_id == "deepseek-chat":
         kwargs["temperature"] = float(temperature)
 
     stream = client.chat.completions.create(**kwargs)
-
     for chunk in stream:
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
-
-        # Feature 2: capture R1's hidden reasoning chain.
         if hasattr(delta, "reasoning_content") and delta.reasoning_content:
             reasoning_text += delta.reasoning_content
             with reasoning_box.container():
                 with st.expander("AI Thinking Process...", expanded=True):
                     st.markdown(reasoning_text)
-
         if getattr(delta, "content", None):
             answer_text += delta.content
             answer_box.markdown(answer_text + "_")
@@ -312,29 +426,29 @@ def stream_response(client, model_id, messages, temperature, max_tokens):
 
 
 # ---------------------------------------------------------------------------
-# 6. STREAMLIT APP
+# 8. STREAMLIT APP
 # ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(page_title="Universal Builder", page_icon=":bricks:",
-                       layout="wide")
+    st.set_page_config(page_title="Universal Builder", page_icon=":bricks:", layout="wide")
 
     if not check_password():
         return
 
     st.title("Universal Builder")
-    st.caption("Books, SaaS apps, schemas and more - powered by DeepSeek.")
+    st.caption("A studio for physics & math books - powered by DeepSeek.")
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # Session state.
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("book_guide", "")
+    st.session_state.setdefault("pending_prompt", None)
 
     api_key, key_source = resolve_api_key()
 
-    # --- Sidebar ----------------------------------------------------------
+    # ----- Sidebar -------------------------------------------------------
     with st.sidebar:
         st.header("Controls")
 
-        # API key handling: ask only if we don't already have one.
         if api_key:
             st.success(f"API key loaded (from {key_source}).")
             with st.expander("Change API key"):
@@ -354,61 +468,110 @@ def main():
                     write_saved_key(entered)
 
         st.divider()
-
         model_label = st.selectbox("Model", list(MODELS.keys()), index=0)
         model_id = MODELS[model_label]
 
         persona_name = st.selectbox("AI Persona", list(PERSONAS.keys()), index=0,
                                     help="Applies to your NEXT message.")
-
-        # Custom persona editor.
         if persona_name == CUSTOM_PERSONA_LABEL:
             system_prompt = st.text_area(
                 "Custom system prompt",
                 value=st.session_state.get("custom_prompt",
                                            "You are a helpful expert assistant."),
-                height=140,
+                height=120,
             )
             st.session_state.custom_prompt = system_prompt
         else:
             system_prompt = PERSONAS[persona_name]
-        st.info(f"Active persona: **{persona_name}**")
+        st.caption(f"Active persona: **{persona_name}**")
+
+        with st.expander("Book Style Guide (kept across chapters)"):
+            st.session_state.book_guide = st.text_area(
+                "Notation, audience, level & conventions",
+                value=st.session_state.book_guide,
+                height=140,
+                placeholder=("e.g. Undergraduate level. Use SI units. Vectors in "
+                             "bold, e.g. F. Denote acceleration a, tension T. "
+                             "Number equations per chapter (2.1, 2.2...)."),
+                help="This is injected into every message so chapters stay consistent.",
+            )
 
         st.divider()
         st.subheader("Generation settings")
-        temperature = st.slider(
-            "Creativity (temperature)", 0.0, 1.5, 0.7, 0.1,
-            help="Higher = more creative. ~1.3 for creative writing, "
-                 "0.0 for precise code. (Ignored by the R1 reasoner model.)",
-        )
+        temperature = st.slider("Creativity (temperature)", 0.0, 1.5, 0.4, 0.1,
+                                help="~0.3 for precise math, ~1.0+ for prose. "
+                                     "Ignored by the R1 reasoner.")
         max_tokens = st.slider("Max response length (tokens)", 256, 8192, 4096, 256)
 
         st.divider()
-        st.caption(f"Local saves go to:\n`{OUTPUT_DIR}`")
+        st.subheader("Book tools")
+        if st.button("Assemble saved chapters -> manuscript"):
+            manuscript, where = assemble_manuscript()
+            if manuscript is None:
+                st.warning(where)
+            else:
+                st.success("Assembled." + (f" Saved to {where}" if where else ""))
+                st.download_button("Download manuscript.md", data=manuscript,
+                                   file_name="manuscript_assembled.md",
+                                   mime="text/markdown")
+        if st.session_state.messages and st.button("Continue writing (extend last reply)"):
+            st.session_state.pending_prompt = (
+                "Continue exactly where you left off, seamlessly, without "
+                "repeating anything you already wrote."
+            )
+            st.rerun()
 
-        # Export the whole conversation.
         if st.session_state.messages:
             transcript = "\n\n".join(
-                f"## {m['role'].title()}\n\n{m['content']}"
-                for m in st.session_state.messages
+                f"## {m['role'].title()}\n\n{m['content']}" for m in st.session_state.messages
             )
-            st.download_button(
-                "Download full conversation (.md)",
-                data=transcript,
-                file_name=f"conversation-{datetime.now():%Y%m%d-%H%M}.md",
-                mime="text/markdown",
-            )
+            st.download_button("Download conversation (.md)", data=transcript,
+                               file_name=f"conversation-{datetime.now():%Y%m%d-%H%M}.md",
+                               mime="text/markdown")
         if st.button("Clear conversation"):
             st.session_state.messages = []
             st.rerun()
 
-    # --- Replay history ---------------------------------------------------
+    # ----- Replay history ------------------------------------------------
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # --- Chat input -------------------------------------------------------
-    prompt = st.chat_input("Ask for a chapter, code, a schema - or say 'Save this as file.txt'")
+    # ----- Figure & Math Lab --------------------------------------------
+    with st.expander("Figure & Math Lab - run / render / verify the AI's code", expanded=False):
+        st.caption("Runs matplotlib & SymPy code so you can SEE a figure or "
+                   "confirm a derivation. Runs code in-process - only run code "
+                   "you trust (yours or the model's).")
+        default_code = extract_last_python_block()
+        code = st.text_area("Python code (auto-filled from the last reply)",
+                            value=default_code, height=220, key="lab_code")
+        if st.button("Run code"):
+            if not code.strip():
+                st.info("No code to run yet. Ask for a figure or a SymPy check first.")
+            else:
+                stdout_text, fig, error = run_python_code(code)
+                if stdout_text.strip():
+                    st.text(stdout_text)
+                if fig is not None:
+                    st.pyplot(fig)
+                    buf = io.BytesIO()
+                    try:
+                        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+                        st.download_button("Download figure (PNG)", data=buf.getvalue(),
+                                           file_name="figure.png", mime="image/png")
+                    except Exception:
+                        pass
+                if error:
+                    st.error("Error while running the code:")
+                    st.code(error)
+                elif fig is None and not stdout_text.strip():
+                    st.info("Ran with no printed output and no figure produced.")
+
+    # ----- Input (chat box OR a queued action) ---------------------------
+    prompt = st.chat_input("Ask for a chapter, a figure, a derivation - or 'Save this as ch1.md'")
+    if not prompt and st.session_state.pending_prompt:
+        prompt = st.session_state.pending_prompt
+        st.session_state.pending_prompt = None
     if not prompt:
         return
 
@@ -416,32 +579,23 @@ def main():
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # Feature 3: intercept save requests before calling the model.
+    # Save interception.
     save_result = handle_possible_save(prompt)
     if save_result is not None:
         with st.chat_message("assistant"):
             fname = save_result["filename"]
             if not save_result["content"]:
-                reply = (
-                    f"I couldn't find any generated content to save as **{fname}** "
-                    f"yet. Ask me to write it first, then say "
-                    f"*\"Save this as {fname}\"*."
-                )
+                reply = (f"I couldn't find content to save as **{fname}** yet. "
+                         f"Generate it first, then say *\"Save this as {fname}\"*.")
                 st.markdown(reply)
             else:
                 if save_result.get("path"):
                     reply = f"Saved **{fname}** to:\n\n`{save_result['path']}`"
                 else:
-                    reply = (
-                        f"Prepared **{fname}** for download (local saving isn't "
-                        f"available in this environment)."
-                    )
+                    reply = f"Prepared **{fname}** for download (local saving unavailable here)."
                 st.markdown(reply)
-                st.download_button(
-                    f"Download {fname}",
-                    data=save_result["content"],
-                    file_name=fname,
-                )
+                st.download_button(f"Download {fname}", data=save_result["content"],
+                                   file_name=fname)
         st.session_state.messages.append({"role": "assistant", "content": reply})
         return
 
@@ -450,30 +604,32 @@ def main():
             st.error("Please add your DeepSeek API key in the sidebar to continue.")
         return
 
-    # --- Call the model ---------------------------------------------------
+    # Compose the full system prompt: persona + the persistent style guide.
+    full_system = system_prompt
+    if st.session_state.book_guide.strip():
+        full_system += "\n\nBOOK STYLE GUIDE (obey strictly):\n" + st.session_state.book_guide.strip()
+
     client = get_client(api_key)
-    api_messages = build_api_messages(system_prompt)  # persona rebuilt live
+    api_messages = build_api_messages(full_system)
 
     with st.chat_message("assistant"):
         try:
-            answer_text = stream_response(
-                client, model_id, api_messages, temperature, max_tokens
-            )
+            answer_text = stream_response(client, model_id, api_messages, temperature, max_tokens)
         except Exception as exc:  # noqa: BLE001
             answer_text = f"Something went wrong calling DeepSeek:\n\n`{exc}`"
             st.error(answer_text)
         else:
-            # Offer a quick download of this single response.
             if answer_text:
-                st.download_button(
-                    "Download this response",
-                    data=answer_text,
-                    file_name=f"response-{datetime.now():%Y%m%d-%H%M%S}.md",
-                    mime="text/markdown",
-                    key=f"dl-{len(st.session_state.messages)}",
-                )
+                st.download_button("Download this response", data=answer_text,
+                                   file_name=f"response-{datetime.now():%Y%m%d-%H%M%S}.md",
+                                   mime="text/markdown",
+                                   key=f"dl-{len(st.session_state.messages)}")
 
     st.session_state.messages.append({"role": "assistant", "content": answer_text})
+    # If the reply contains runnable code, hint the user toward the Lab.
+    if re.search(r"```(?:python|py)?\s*\n", answer_text or ""):
+        st.info("This reply contains code - open **Figure & Math Lab** above to "
+                "render the figure or run the verification.")
 
 
 if __name__ == "__main__":

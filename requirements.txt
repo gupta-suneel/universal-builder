@@ -1,2 +1,5 @@
 streamlit>=1.36
 openai>=1.40
+numpy>=1.26
+matplotlib>=3.8
+sympy>=1.12
