@@ -417,15 +417,17 @@ def run_python_code(code: str):
     return result
 
 
-def render_book_message(text: str, show_code: bool):
+def render_book_message(text, show_code, msg_index=0, client=None, model_id="deepseek-chat"):
     """Render a reply as a book: prose as markdown, figure code as live images,
-    verification code as a small collapsible note."""
-    for seg in split_segments(text):
+    verification code as a small collapsible note. Failed figures get a one-click
+    'Redraw this figure' repair button."""
+    for bi, seg in enumerate(split_segments(text)):
         if seg[0] == "text":
             if seg[1].strip():
                 st.markdown(seg[1])
             continue
         _, lang, body = seg
+        uid = f"{msg_index}-{bi}"
         # Non-python code (sql, js, ...) -> show as a normal code block.
         if lang not in ("", "python", "py"):
             st.code(body, language=lang or None)
@@ -439,9 +441,23 @@ def render_book_message(text: str, show_code: bool):
                     st.code(body, language="python")
             st.download_button("Download figure (PNG)", data=res["png"],
                                file_name="figure.png", mime="image/png",
-                               key=f"png-{hash(body) & 0xffffffff}")
+                               key=f"png-{uid}")
         elif res["error"]:
-            with st.expander("A figure could not be rendered (show code & error)"):
+            cap = _caption_from_code(body) or "this figure"
+            st.warning(f"A figure could not be rendered ({cap}).")
+            if client is not None:
+                if st.button("Redraw this figure", key=f"redraw-{uid}"):
+                    with st.spinner("Redrawing the figure..."):
+                        fixed = repair_figure(client, model_id, body, res["error"])
+                    if fixed:
+                        msgs = st.session_state.messages
+                        msgs[msg_index]["content"] = msgs[msg_index]["content"].replace(
+                            body, fixed + "\n", 1)
+                        st.rerun()
+                    else:
+                        st.warning("Couldn't auto-fix it - try asking in the chat to "
+                                   "redraw it differently.")
+            with st.expander("Show figure code & error"):
                 st.code(body, language="python")
                 st.code(res["error"])
         elif res["stdout"].strip():
@@ -459,6 +475,29 @@ def render_book_message(text: str, show_code: bool):
 
 def get_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+
+
+def repair_figure(client, model_id, code, error):
+    """Ask the model to fix one broken figure block. Returns corrected code or None."""
+    sys = ("You fix broken matplotlib figure code. Return ONLY one corrected, "
+           "self-contained ```python code block that runs without error and draws "
+           "the intended figure. Keep any '# FIGURE:' caption comment. Compute from "
+           "real equations with numpy. No prose, no explanation.")
+    user = (f"This figure code failed:\n\n```python\n{code}\n```\n\n"
+            f"Error / traceback:\n{error}\n\nReturn the corrected code block only.")
+    kwargs = {"model": model_id,
+              "messages": [{"role": "system", "content": sys},
+                           {"role": "user", "content": user}],
+              "max_tokens": 2000}
+    if model_id == "deepseek-chat":
+        kwargs["temperature"] = 0.2
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        text = resp.choices[0].message.content or ""
+    except Exception:
+        return None
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
+    return (m.group(1).strip() if m else text.strip()) or None
 
 
 def build_api_messages(system_prompt: str):
@@ -619,10 +658,12 @@ def main():
 
     # ----- Replay history (figures rendered inline, like a book) ---------
     show_code = st.session_state.get("show_code", False)
-    for msg in st.session_state.messages:
+    render_client = get_client(api_key) if api_key else None
+    for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
-                render_book_message(msg["content"], show_code)
+                render_book_message(msg["content"], show_code, idx,
+                                    render_client, model_id)
             else:
                 st.markdown(msg["content"])
 
