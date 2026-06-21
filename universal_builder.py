@@ -9,8 +9,8 @@ CORE FEATURES
   1. DYNAMIC PERSONA SHIFTER   - switching persona applies on the next message;
      the system prompt is rebuilt fresh every call. Includes book-writing
      personas with physics-figure and math conventions baked in.
-  2. DEEPSEEK REASONING CHAINS - the R1 reasoner's hidden chain-of-thought
-     streams into a collapsible "AI Thinking Process" box.
+  2. DEEPSEEK REASONING CHAINS - in Thinking mode, the model's hidden
+     chain-of-thought streams into a collapsible "AI Thinking Process" box.
   3. LOCAL FILE AUTO-SAVING    - "Save this chapter as kinematics.txt" writes to
      ~/Documents/ai-workspace/universal_book_builder/output/ (+ a download).
   4. PERSISTENT API KEY        - read from secrets / env / saved file; asked once.
@@ -50,9 +50,12 @@ APP_DIR = Path.home() / "Documents" / "ai-workspace" / "universal_book_builder"
 OUTPUT_DIR = APP_DIR / "output"
 CONFIG_FILE = APP_DIR / "config.json"
 
+# DeepSeek's current API models (the older deepseek-chat / deepseek-reasoner
+# names are legacy aliases scheduled for retirement on 2026/07/24). Thinking
+# mode is now a parameter, not a separate model.
 MODELS = {
-    "DeepSeek V3 (deepseek-chat) - fast, general purpose": "deepseek-chat",
-    "DeepSeek R1 (deepseek-reasoner) - deep step-by-step thinking": "deepseek-reasoner",
+    "DeepSeek V4 Flash - fast & economical": "deepseek-v4-flash",
+    "DeepSeek V4 Pro - frontier reasoning (best for hard math)": "deepseek-v4-pro",
 }
 
 # ---------------------------------------------------------------------------
@@ -417,7 +420,7 @@ def run_python_code(code: str):
     return result
 
 
-def render_book_message(text, show_code, msg_index=0, client=None, model_id="deepseek-chat"):
+def render_book_message(text, show_code, msg_index=0, client=None, model_id="deepseek-v4-flash"):
     """Render a reply as a book: prose as markdown, figure code as live images,
     verification code as a small collapsible note. Failed figures get a one-click
     'Redraw this figure' repair button."""
@@ -488,9 +491,8 @@ def repair_figure(client, model_id, code, error):
     kwargs = {"model": model_id,
               "messages": [{"role": "system", "content": sys},
                            {"role": "user", "content": user}],
-              "max_tokens": 2000}
-    if model_id == "deepseek-chat":
-        kwargs["temperature"] = 0.2
+              "max_tokens": 2000, "temperature": 0.2,
+              "extra_body": {"thinking": {"type": "disabled"}}}
     try:
         resp = client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content or ""
@@ -512,7 +514,7 @@ def build_api_messages(system_prompt: str):
     return [system_msg] + history
 
 
-def stream_response(client, model_id, messages, temperature, max_tokens):
+def stream_response(client, model_id, messages, temperature, max_tokens, thinking):
     reasoning_box = st.empty()
     answer_box = st.empty()
     reasoning_text = ""
@@ -520,7 +522,13 @@ def stream_response(client, model_id, messages, temperature, max_tokens):
 
     kwargs = {"model": model_id, "messages": messages, "stream": True,
               "max_tokens": int(max_tokens)}
-    if model_id == "deepseek-chat":
+    if thinking:
+        # Thinking mode reasons step-by-step and returns reasoning_content.
+        # It ignores temperature, so we don't send it.
+        kwargs["reasoning_effort"] = "high"
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    else:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         kwargs["temperature"] = float(temperature)
 
     stream = client.chat.completions.create(**kwargs)
@@ -590,6 +598,13 @@ def main():
         st.divider()
         model_label = st.selectbox("Model", list(MODELS.keys()), index=0)
         model_id = MODELS[model_label]
+        thinking = st.checkbox(
+            "Thinking mode (deeper reasoning; shows thought process)",
+            value=True,
+            help="On: the model reasons step-by-step before answering - best for "
+                 "hard math and derivations, and it shows its thinking. The "
+                 "creativity slider is ignored in this mode. Off: faster, and the "
+                 "creativity slider applies.")
 
         persona_name = st.selectbox("AI Persona", list(PERSONAS.keys()), index=0,
                                     help="Applies to your NEXT message.")
@@ -620,7 +635,7 @@ def main():
         st.subheader("Generation settings")
         temperature = st.slider("Creativity (temperature)", 0.0, 1.5, 0.4, 0.1,
                                 help="~0.3 for precise math, ~1.0+ for prose. "
-                                     "Ignored by the R1 reasoner.")
+                                     "Ignored while Thinking mode is on.")
         max_tokens = st.slider("Max response length (tokens)", 256, 8192, 4096, 256)
 
         st.divider()
@@ -717,7 +732,8 @@ def main():
         try:
             # Stream the draft live (shows progress); figures get rendered on the
             # rerun below so they appear inline within the finished text.
-            answer_text = stream_response(client, model_id, api_messages, temperature, max_tokens)
+            answer_text = stream_response(client, model_id, api_messages,
+                                          temperature, max_tokens, thinking)
         except Exception as exc:  # noqa: BLE001
             answer_text = f"Something went wrong calling DeepSeek:\n\n`{exc}`"
             st.error(answer_text)
