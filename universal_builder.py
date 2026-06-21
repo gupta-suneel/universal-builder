@@ -128,15 +128,37 @@ HOW TO EMIT FIGURES (the app renders them automatically and inline):
   ```python code block at exactly that point in the writing.
 - Begin every figure block with a caption comment on the first line, like:
       # FIGURE: Figure 2.1 - Potential energy well
-- Compute everything from the real equations with numpy/matplotlib, set axis
-  labels with units, a legend if needed, and ax.set_aspect('equal') for geometry.
-- Do NOT write "see the figure below / run this code / as shown in the plot you
-  can generate". Just place the block; it becomes the figure.
-- One figure per code block. Make each block runnable on its own (do its own
-  imports). plt.show() is optional and harmless.
+
+USE THE VETTED TOOLKIT FIRST (this is critical for correct geometry):
+- A pre-tested physics-figure library is preloaded as `phys`. Its drawing
+  functions have CORRECT geometry baked in (ropes tangent to pulleys, equal
+  tension, force arrows proportional, true angles). PREFER these over hand-drawn
+  matplotlib whenever one fits -- hand-drawn schematics are usually wrong.
+- Available helpers (call with a matplotlib Axes `ax`):
+{catalog}
+- Pattern: create `fig, ax = plt.subplots()`, call the helper, done. Example:
+      # FIGURE: Figure 3.2 - Atwood machine
+      import matplotlib.pyplot as plt
+      import physlib as phys
+      fig, ax = plt.subplots()
+      phys.atwood(ax, m1=3, m2=5)
+- If you must customise, you may pass functions (e.g. phys.potential_well(ax,
+  V=lambda x: 0.25*x**4 - x**2)) or draw extra matplotlib on the same `ax`.
+- Only hand-roll matplotlib when NO helper fits; then compute from real
+  equations with numpy and use ax.set_aspect('equal') for geometric figures.
+
+GENERAL RULES:
+- Do NOT write "see the figure below / run this code". Just place the block.
+- One figure per code block; each block runnable on its own (do its own imports).
 - For a symbolic/numeric VERIFICATION (not a drawing), use a ```python block that
-  prints its result; the app shows that result in a small collapsible note.
+  prints its result; the app shows it in a small collapsible note.
 """.strip()
+
+try:
+    import physlib as _physlib
+    FIGURE_EMISSION = FIGURE_EMISSION.replace("{catalog}", _physlib.CATALOG)
+except Exception:
+    FIGURE_EMISSION = FIGURE_EMISSION.replace("{catalog}", "(toolkit catalog unavailable)")
 
 # ---------------------------------------------------------------------------
 # 2. PERSONAS
@@ -400,9 +422,13 @@ def run_python_code(code: str):
             import sympy as sp
         except Exception:
             sp = None
+        try:
+            import physlib as phys  # vetted physics-figure toolkit
+        except Exception:
+            phys = None
         plt.close("all")
         ns = {"plt": plt, "matplotlib": matplotlib, "np": np, "numpy": np,
-              "sp": sp, "sympy": sp, "__name__": "__main__"}
+              "sp": sp, "sympy": sp, "phys": phys, "__name__": "__main__"}
         with contextlib.redirect_stdout(out):
             exec(code, ns)  # noqa: S102 - intentional, user-controlled content
         result["stdout"] = out.getvalue()
