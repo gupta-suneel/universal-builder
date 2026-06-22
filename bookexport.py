@@ -280,20 +280,25 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
 """
 
 
+_DISPLAY_MATH = re.compile(r"(\$\$.+?\$\$|\\\[.+?\\\])", re.DOTALL)
+_EMPH_LINE = re.compile(r"^\s*\*{1,2}([^*].*?)\*{1,2}\s*$")
+
+
 def _latex_escape_text(s):
-    """Escape LaTeX specials in prose, leaving $...$ math untouched and
-    converting **bold** to \\textbf{}."""
-    parts = re.split(r"(\$\$.+?\$\$|\$[^$]+?\$)", s, flags=re.DOTALL)
+    """Escape LaTeX specials in prose, leaving inline $...$ math untouched and
+    converting **bold** / *italic* markdown."""
+    parts = re.split(r"(\$[^$]+?\$)", s)
     out = []
     for p in parts:
         if not p:
             continue
-        if p.startswith("$"):
-            out.append(p)            # math: pass straight through (already LaTeX)
+        if p.startswith("$") and p.endswith("$"):
+            out.append(p)            # inline math: already LaTeX, pass through
             continue
         for ch, rep in [("&", r"\&"), ("%", r"\%"), ("#", r"\#"), ("_", r"\_")]:
             p = p.replace(ch, rep)
-        p = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", p)
+        p = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", p)   # bold first
+        p = re.sub(r"\*([^*\n]+?)\*", r"\\textit{\1}", p)  # then italic
         out.append(p)
     return "".join(out)
 
@@ -322,25 +327,39 @@ def build_latex(messages, title, out_dir):
             continue
         for seg in _segments(m["content"]):
             if seg[0] == "text":
-                for raw in seg[1].split("\n"):
-                    line = raw.rstrip()
-                    if not line.strip():
-                        _close_list()
-                        body.append("")
+                # Protect multi-line display math ($$...$$ / \[...\]) before any
+                # line processing, so subscripts etc. are never escaped.
+                for chunk in _DISPLAY_MATH.split(seg[1]):
+                    if not chunk or not chunk.strip():
                         continue
-                    if line.startswith("### "):
-                        _close_list(); body.append(r"\subsubsection*{%s}" % _latex_escape_text(line[4:]))
-                    elif line.startswith("## "):
-                        _close_list(); body.append(r"\subsection*{%s}" % _latex_escape_text(line[3:]))
-                    elif line.startswith("# "):
-                        _close_list(); body.append(r"\section*{%s}" % _latex_escape_text(line[2:]))
-                    elif line.lstrip().startswith(("- ", "* ")):
-                        if not in_list:
-                            body.append(r"\begin{itemize}"); in_list = True
-                        body.append(r"\item " + _latex_escape_text(line.lstrip()[2:]))
-                    else:
+                    cs = chunk.lstrip()
+                    if cs.startswith("$$") or cs.startswith("\\["):
                         _close_list()
-                        body.append(_latex_escape_text(line))
+                        body.append(chunk.strip())          # raw display math
+                        continue
+                    for raw in chunk.split("\n"):
+                        line = raw.rstrip()
+                        if not line.strip():
+                            _close_list(); body.append(""); continue
+                        if line.strip() in ("---", "***", "___", "—", "--"):
+                            _close_list(); body.append(r"\medskip"); continue
+                        if line.startswith("### "):
+                            _close_list(); body.append(r"\subsubsection*{%s}" % _latex_escape_text(line[4:]))
+                        elif line.startswith("## "):
+                            _close_list(); body.append(r"\subsection*{%s}" % _latex_escape_text(line[3:]))
+                        elif line.startswith("# "):
+                            _close_list(); body.append(r"\section*{%s}" % _latex_escape_text(line[2:]))
+                        elif line.lstrip().startswith(("- ", "+ ")):
+                            if not in_list:
+                                body.append(r"\begin{itemize}"); in_list = True
+                            body.append(r"\item " + _latex_escape_text(line.lstrip()[2:]))
+                        elif _EMPH_LINE.match(line):
+                            # a whole line wrapped in * or ** = a heading the model meant
+                            _close_list()
+                            body.append(r"\subsection*{%s}" % _latex_escape_text(_EMPH_LINE.match(line).group(1)))
+                        else:
+                            _close_list()
+                            body.append(_latex_escape_text(line))
             else:
                 _close_list()
                 _, lang, code = seg
