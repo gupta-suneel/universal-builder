@@ -737,6 +737,8 @@ def main():
     st.session_state.setdefault("loaded_project", None)
 
     api_key, key_source = resolve_api_key()
+    if not api_key and st.session_state.get("api_key_session"):
+        api_key, key_source = st.session_state["api_key_session"], "this session"
     store = get_store()
 
     # ----- Sidebar -------------------------------------------------------
@@ -746,20 +748,26 @@ def main():
         if api_key:
             st.success(f"API key loaded (from {key_source}).")
             with st.expander("Change API key"):
-                new_key = st.text_input("New DeepSeek API key", type="password")
-                if st.button("Update & remember") and new_key:
-                    write_saved_key(new_key)
-                    st.success("Saved. Reloading...")
-                    st.rerun()
+                with st.form("change_key_form", clear_on_submit=True):
+                    new_key = st.text_input("New DeepSeek API key", type="password")
+                    if st.form_submit_button("Update & save") and new_key:
+                        write_saved_key(new_key)
+                        st.session_state["api_key_session"] = new_key
+                        st.rerun()
         else:
             st.warning("No API key found yet.")
-            entered = st.text_input("DeepSeek API key", type="password",
-                                    help="Get one at platform.deepseek.com")
-            remember = st.checkbox("Remember this key on this computer", value=True)
-            if entered:
-                api_key = entered
+            with st.form("api_key_form"):
+                entered = st.text_input("DeepSeek API key", type="password",
+                                        help="Get one at platform.deepseek.com")
+                remember = st.checkbox("Remember this key on this computer", value=True)
+                submitted = st.form_submit_button("Save & use key")
+            if submitted and entered:
+                st.session_state["api_key_session"] = entered
                 if remember:
                     write_saved_key(entered)
+                st.rerun()
+            elif submitted and not entered:
+                st.error("Please paste your key first.")
 
         st.divider()
         st.subheader("Memory & backups")
