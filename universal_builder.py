@@ -32,6 +32,7 @@ import io
 import json
 import os
 import re
+import time
 import contextlib
 import traceback
 from datetime import datetime
@@ -320,15 +321,66 @@ def save_state(store, project, data):
         return False
 
 
+# ---- Local persistence + timestamped backups (dependable when run locally) --
+PROJECTS_DIR = APP_DIR / "projects"
+BACKUPS_DIR = APP_DIR / "backups"
+
+
+def _safe_name(name):
+    return re.sub(r"[^\w\- ]", "_", name or "").strip() or "My Book"
+
+
+def save_local(project, data, keep_backups=40):
+    """Write the project JSON to disk plus a timestamped backup. Best-effort."""
+    try:
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        (PROJECTS_DIR / f"{_safe_name(project)}.json").write_text(
+            json.dumps(data), encoding="utf-8")
+        BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        (BACKUPS_DIR / f"{_safe_name(project)}__{ts}.json").write_text(
+            json.dumps(data), encoding="utf-8")
+        backups = list_backups(project)
+        for old in backups[keep_backups:]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def load_local(project):
+    try:
+        p = PROJECTS_DIR / f"{_safe_name(project)}.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def list_backups(project):
+    """Most-recent-first list of backup files for a project."""
+    if not BACKUPS_DIR.exists():
+        return []
+    prefix = _safe_name(project) + "__"
+    return sorted([p for p in BACKUPS_DIR.iterdir() if p.name.startswith(prefix)],
+                  reverse=True)
+
+
 def persist_now(store, project):
-    """Save the current session (messages + book guide) to cloud memory."""
-    if not store:
-        return
-    save_state(store, project, {
+    """Save the current session to local disk AND cloud (if configured)."""
+    data = {
         "messages": st.session_state.get("messages", []),
         "book_guide": st.session_state.get("book_guide", ""),
         "custom_prompt": st.session_state.get("custom_prompt", ""),
-    })
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_local(project, data)          # always keep a local copy + backup
+    if store:
+        save_state(store, project, data)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +680,21 @@ def stream_response(client, model_id, messages, temperature, max_tokens, thinkin
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         kwargs["temperature"] = float(temperature)
 
-    stream = client.chat.completions.create(**kwargs)
+    # Establish the stream with a few retries for transient network/API hiccups.
+    stream = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            stream = client.chat.completions.create(**kwargs)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if attempt < 2:
+                st.caption(f"Connection hiccup, retrying ({attempt + 1}/2)...")
+                time.sleep(1.5 * (attempt + 1))
+    if stream is None:
+        raise last_err
+
     for chunk in stream:
         if not chunk.choices:
             continue
@@ -696,17 +762,36 @@ def main():
                     write_saved_key(entered)
 
         st.divider()
+        st.subheader("Memory & backups")
+        new_project = st.text_input("Project (book) name",
+                                    value=st.session_state.project)
+        if new_project and new_project != st.session_state.project:
+            st.session_state.project = new_project
+            st.session_state.loaded_project = None
+            st.rerun()
         if store:
-            st.success("Cloud memory: ON (auto-saves & restores)")
-            new_project = st.text_input("Project (book) name",
-                                        value=st.session_state.project)
-            st.session_state.project = new_project or "My Book"
-            if st.button("Reload this project from cloud"):
-                st.session_state.loaded_project = None
-                st.rerun()
+            st.success("Auto-save: cloud + local disk")
         else:
-            st.info("Cloud memory: OFF. Add SUPABASE_URL and SUPABASE_KEY in the "
-                    "app's Secrets to keep history across logins.")
+            st.caption("Auto-save: local disk (every reply). Add SUPABASE keys in "
+                       "Secrets to also sync to the cloud.")
+        if st.button("Reload this project"):
+            st.session_state.loaded_project = None
+            st.rerun()
+        _bk = list_backups(st.session_state.project)
+        if _bk:
+            with st.expander(f"Restore an earlier version ({len(_bk)} backups)"):
+                _labels = [b.stem.split("__", 1)[-1] for b in _bk]
+                _pick = st.selectbox("Saved versions (newest first)", _labels,
+                                     key="backup_pick")
+                if st.button("Restore this version"):
+                    try:
+                        _d = json.loads(_bk[_labels.index(_pick)].read_text(encoding="utf-8"))
+                        st.session_state.messages = _d.get("messages", [])
+                        st.session_state.book_guide = _d.get("book_guide",
+                                                             st.session_state.book_guide)
+                        st.rerun()
+                    except Exception:
+                        st.warning("Could not read that backup.")
 
         st.divider()
         model_label = st.selectbox("Model", list(MODELS.keys()), index=0)
@@ -773,6 +858,34 @@ def main():
             )
             st.rerun()
 
+        # Export the finished book (figures + math included).
+        if st.session_state.messages:
+            with st.expander("Export finished book"):
+                if st.button("Build Word (.docx)"):
+                    try:
+                        import bookexport
+                        ensure_output_dir()
+                        out = OUTPUT_DIR / f"{_safe_name(st.session_state.project)}.docx"
+                        bookexport.build_docx(st.session_state.messages,
+                                              st.session_state.project, str(out))
+                        st.download_button("Download .docx", data=out.read_bytes(),
+                                           file_name=out.name,
+                                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                        st.caption(f"Also saved to {out}")
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning(f"Word export failed: {exc}")
+                if st.button("Build printable HTML (then Print -> Save as PDF)"):
+                    try:
+                        import bookexport
+                        html = bookexport.build_html(st.session_state.messages,
+                                                     st.session_state.project)
+                        st.download_button("Download .html", data=html,
+                                           file_name=f"{_safe_name(st.session_state.project)}.html",
+                                           mime="text/html")
+                        st.caption("Open it in your browser, then Print -> Save as PDF.")
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning(f"HTML export failed: {exc}")
+
         if st.session_state.messages:
             transcript = "\n\n".join(
                 f"## {m['role'].title()}\n\n{m['content']}" for m in st.session_state.messages
@@ -784,10 +897,12 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # ----- Restore from cloud memory (once per project) ------------------
+    # ----- Restore memory (cloud if configured, else local disk) ---------
     project = st.session_state.project
-    if store and st.session_state.loaded_project != project:
-        data = load_state(store, project)
+    if st.session_state.loaded_project != project:
+        data = load_state(store, project) if store else None
+        if data is None:
+            data = load_local(project)          # local disk fallback
         st.session_state.messages = (data or {}).get("messages", [])
         if data and data.get("book_guide"):
             st.session_state.book_guide = data["book_guide"]
