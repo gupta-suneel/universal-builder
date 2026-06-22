@@ -40,6 +40,11 @@ from pathlib import Path
 import streamlit as st
 from openai import OpenAI
 
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
 # ---------------------------------------------------------------------------
 # 0. CONSTANTS & PATHS
 # ---------------------------------------------------------------------------
@@ -258,6 +263,72 @@ def resolve_api_key():
     if key:
         return key, "saved file"
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# 3b. CLOUD MEMORY  (auto-save / auto-restore via Supabase)
+# ---------------------------------------------------------------------------
+# Streamlit Cloud is stateless, so we persist the conversation to a free
+# Supabase table. Configure SUPABASE_URL and SUPABASE_KEY (service_role) in
+# the app's Secrets. The table is created once with:
+#   create table if not exists book_sessions (
+#     key text primary key, data jsonb, updated_at timestamptz default now());
+
+SUPA_TABLE = "book_sessions"
+
+
+def get_store():
+    """Return {'url','key'} if cloud memory is configured, else None."""
+    url = get_secret("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
+    key = get_secret("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY")
+    if url and key and requests is not None:
+        return {"url": str(url).rstrip("/"), "key": str(key)}
+    return None
+
+
+def _supa_headers(store):
+    return {"apikey": store["key"], "Authorization": f"Bearer {store['key']}",
+            "Content-Type": "application/json"}
+
+
+def load_state(store, project):
+    """Fetch a saved project's data dict from Supabase, or None."""
+    try:
+        r = requests.get(f"{store['url']}/rest/v1/{SUPA_TABLE}",
+                         params={"key": f"eq.{project}", "select": "data"},
+                         headers=_supa_headers(store), timeout=12)
+        if r.status_code == 200:
+            rows = r.json()
+            if rows:
+                return rows[0].get("data")
+    except Exception:
+        return None
+    return None
+
+
+def save_state(store, project, data):
+    """Upsert a project's data dict to Supabase. Returns True on success."""
+    try:
+        r = requests.post(
+            f"{store['url']}/rest/v1/{SUPA_TABLE}",
+            params={"on_conflict": "key"},
+            headers={**_supa_headers(store),
+                     "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=[{"key": project, "data": data}], timeout=12)
+        return r.status_code in (200, 201, 204)
+    except Exception:
+        return False
+
+
+def persist_now(store, project):
+    """Save the current session (messages + book guide) to cloud memory."""
+    if not store:
+        return
+    save_state(store, project, {
+        "messages": st.session_state.get("messages", []),
+        "book_guide": st.session_state.get("book_guide", ""),
+        "custom_prompt": st.session_state.get("custom_prompt", ""),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -596,8 +667,11 @@ def main():
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("book_guide", "")
     st.session_state.setdefault("pending_prompt", None)
+    st.session_state.setdefault("project", "My Book")
+    st.session_state.setdefault("loaded_project", None)
 
     api_key, key_source = resolve_api_key()
+    store = get_store()
 
     # ----- Sidebar -------------------------------------------------------
     with st.sidebar:
@@ -620,6 +694,19 @@ def main():
                 api_key = entered
                 if remember:
                     write_saved_key(entered)
+
+        st.divider()
+        if store:
+            st.success("Cloud memory: ON (auto-saves & restores)")
+            new_project = st.text_input("Project (book) name",
+                                        value=st.session_state.project)
+            st.session_state.project = new_project or "My Book"
+            if st.button("Reload this project from cloud"):
+                st.session_state.loaded_project = None
+                st.rerun()
+        else:
+            st.info("Cloud memory: OFF. Add SUPABASE_URL and SUPABASE_KEY in the "
+                    "app's Secrets to keep history across logins.")
 
         st.divider()
         model_label = st.selectbox("Model", list(MODELS.keys()), index=0)
@@ -697,6 +784,17 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
+    # ----- Restore from cloud memory (once per project) ------------------
+    project = st.session_state.project
+    if store and st.session_state.loaded_project != project:
+        data = load_state(store, project)
+        st.session_state.messages = (data or {}).get("messages", [])
+        if data and data.get("book_guide"):
+            st.session_state.book_guide = data["book_guide"]
+        if data and data.get("custom_prompt"):
+            st.session_state.custom_prompt = data["custom_prompt"]
+        st.session_state.loaded_project = project
+
     # ----- Replay history (figures rendered inline, like a book) ---------
     show_code = st.session_state.get("show_code", False)
     render_client = get_client(api_key) if api_key else None
@@ -738,6 +836,7 @@ def main():
                 st.download_button(f"Download {fname}", data=save_result["content"],
                                    file_name=fname)
         st.session_state.messages.append({"role": "assistant", "content": reply})
+        persist_now(store, project)
         return
 
     if not api_key:
@@ -766,6 +865,7 @@ def main():
             failed = True
 
     st.session_state.messages.append({"role": "assistant", "content": answer_text})
+    persist_now(store, project)  # auto-save to cloud memory
     # Re-run so the reply is re-rendered as a book with figures executed inline.
     if not failed:
         st.rerun()
