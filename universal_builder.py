@@ -893,6 +893,35 @@ def main():
                         st.caption("Open it in your browser, then Print -> Save as PDF.")
                     except Exception as exc:  # noqa: BLE001
                         st.warning(f"HTML export failed: {exc}")
+                st.caption("Highest quality (vector math + figures):")
+                if st.button("Build LaTeX book (vector PDF)"):
+                    try:
+                        import bookexport, zipfile
+                        ensure_output_dir()
+                        name = _safe_name(st.session_state.project)
+                        book_dir = OUTPUT_DIR / f"book_{name}"
+                        res = bookexport.build_latex(st.session_state.messages,
+                                                     st.session_state.project, str(book_dir))
+                        # zip the whole folder (book.tex + figures/)
+                        zbuf = io.BytesIO()
+                        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+                            for f in book_dir.rglob("*"):
+                                if f.is_file():
+                                    z.write(f, f.relative_to(book_dir.parent))
+                        st.download_button("Download book folder (.zip)", data=zbuf.getvalue(),
+                                           file_name=f"{name}_latex_book.zip", mime="application/zip")
+                        if res.get("pdf"):
+                            st.download_button("Download compiled PDF (vector)",
+                                               data=Path(res["pdf"]).read_bytes(),
+                                               file_name=f"{name}.pdf", mime="application/pdf")
+                            st.success(f"Compiled {res['n_figures']} vector figures into a PDF.")
+                        else:
+                            st.info("Built book.tex + vector figures. No LaTeX engine found "
+                                    "here, so open the folder and compile book.tex (e.g. with "
+                                    "MacTeX) to get the PDF.")
+                        st.caption(f"Saved to {book_dir}")
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning(f"LaTeX export failed: {exc}")
 
         if st.session_state.messages:
             transcript = "\n\n".join(

@@ -13,11 +13,23 @@ the Streamlit app.
 """
 
 import io
+import os
 import re
 import base64
+import shutil
+import subprocess
 import contextlib
+from pathlib import Path
 
 _CODE_SPLIT = re.compile(r"```([\w+\-]*)\s*\n(.*?)```", re.DOTALL)
+
+
+def _fig_caption(code):
+    for line in code.splitlines()[:4]:
+        m = re.match(r"\s*#\s*FIGURE:\s*(.+)", line, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
 
 
 def _segments(text):
@@ -56,11 +68,41 @@ def render_code_to_png(code):
         if not nums:
             return None
         buf = io.BytesIO()
-        plt.figure(nums[-1]).savefig(buf, format="png", dpi=200, bbox_inches="tight")
+        plt.figure(nums[-1]).savefig(buf, format="png", dpi=300, bbox_inches="tight")
         plt.close("all")
         return buf.getvalue()
     except Exception:
         return None
+
+
+def render_code_to_pdf(code, path):
+    """Run figure code and save it as a VECTOR pdf (sharp at any size). True/False."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        try:
+            import sympy as sp
+        except Exception:
+            sp = None
+        try:
+            import physlib as phys
+        except Exception:
+            phys = None
+        plt.close("all")
+        ns = {"plt": plt, "matplotlib": matplotlib, "np": np, "numpy": np,
+              "sp": sp, "sympy": sp, "phys": phys, "__name__": "__main__"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(code, ns)  # noqa: S102
+        nums = plt.get_fignums()
+        if not nums:
+            return False
+        plt.figure(nums[-1]).savefig(path, format="pdf", bbox_inches="tight")
+        plt.close("all")
+        return True
+    except Exception:
+        return False
 
 
 def _math_to_png(latex, display=False, fontsize=15):
@@ -75,7 +117,7 @@ def _math_to_png(latex, display=False, fontsize=15):
         fig = plt.figure(figsize=(0.01, 0.01))
         t = fig.text(0, 0, f"${s}$", fontsize=fontsize if not display else fontsize + 3)
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight",
                     pad_inches=0.05, transparent=True)
         plt.close(fig)
         return buf.getvalue()
@@ -217,3 +259,117 @@ def build_docx(messages, title, path):
                         doc.add_picture(io.BytesIO(png), width=Inches(5.0))
     doc.save(path)
     return path
+
+
+# ---------------------------------------------------------------------------
+# LATEX  (highest quality: native LaTeX math + vector PDF figures -> PDF)
+# ---------------------------------------------------------------------------
+
+_LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\title{%s}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+"""
+
+
+def _latex_escape_text(s):
+    """Escape LaTeX specials in prose, leaving $...$ math untouched and
+    converting **bold** to \\textbf{}."""
+    parts = re.split(r"(\$\$.+?\$\$|\$[^$]+?\$)", s, flags=re.DOTALL)
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        if p.startswith("$"):
+            out.append(p)            # math: pass straight through (already LaTeX)
+            continue
+        for ch, rep in [("&", r"\&"), ("%", r"\%"), ("#", r"\#"), ("_", r"\_")]:
+            p = p.replace(ch, rep)
+        p = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", p)
+        out.append(p)
+    return "".join(out)
+
+
+def build_latex(messages, title, out_dir):
+    """
+    Write a LaTeX book to out_dir: book.tex + figures/*.pdf (vector). If a
+    LaTeX engine (pdflatex) is available, also compile out_dir/book.pdf.
+    Returns dict {dir, tex, pdf_or_None, n_figures}.
+    """
+    out = Path(out_dir)
+    figs = out / "figures"
+    figs.mkdir(parents=True, exist_ok=True)
+    body = []
+    in_list = False
+    fig_n = 0
+
+    def _close_list():
+        nonlocal in_list
+        if in_list:
+            body.append(r"\end{itemize}")
+            in_list = False
+
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for seg in _segments(m["content"]):
+            if seg[0] == "text":
+                for raw in seg[1].split("\n"):
+                    line = raw.rstrip()
+                    if not line.strip():
+                        _close_list()
+                        body.append("")
+                        continue
+                    if line.startswith("### "):
+                        _close_list(); body.append(r"\subsubsection*{%s}" % _latex_escape_text(line[4:]))
+                    elif line.startswith("## "):
+                        _close_list(); body.append(r"\subsection*{%s}" % _latex_escape_text(line[3:]))
+                    elif line.startswith("# "):
+                        _close_list(); body.append(r"\section*{%s}" % _latex_escape_text(line[2:]))
+                    elif line.lstrip().startswith(("- ", "* ")):
+                        if not in_list:
+                            body.append(r"\begin{itemize}"); in_list = True
+                        body.append(r"\item " + _latex_escape_text(line.lstrip()[2:]))
+                    else:
+                        _close_list()
+                        body.append(_latex_escape_text(line))
+            else:
+                _close_list()
+                _, lang, code = seg
+                if lang not in ("", "python", "py"):
+                    continue
+                fig_n += 1
+                fname = f"fig{fig_n}.pdf"
+                if render_code_to_pdf(code, str(figs / fname)):
+                    cap = _fig_caption(code)
+                    body.append(r"\begin{figure}[H]\centering")
+                    body.append(r"\includegraphics[width=0.78\textwidth]{figures/%s}" % fname)
+                    if cap:
+                        body.append(r"\caption{%s}" % _latex_escape_text(cap))
+                    body.append(r"\end{figure}")
+    _close_list()
+
+    tex = (_LATEX_PREAMBLE % _latex_escape_text(title)) + "\n".join(body) + "\n\\end{document}\n"
+    tex_path = out / "book.tex"
+    tex_path.write_text(tex, encoding="utf-8")
+
+    pdf_path = None
+    if shutil.which("pdflatex"):
+        try:
+            for _ in range(2):  # twice for references/toc
+                subprocess.run(["pdflatex", "-interaction=nonstopmode", "book.tex"],
+                               cwd=str(out), stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=120)
+            if (out / "book.pdf").exists():
+                pdf_path = str(out / "book.pdf")
+        except Exception:
+            pdf_path = None
+    return {"dir": str(out), "tex": str(tex_path), "pdf": pdf_path, "n_figures": fig_n}
